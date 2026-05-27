@@ -5,6 +5,7 @@ import os
 import logging
 import datetime
 import threading
+import random
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from logging.handlers import TimedRotatingFileHandler
@@ -78,8 +79,30 @@ def _wait_until(
         return
 
 
+def _fire_and_forget_warm_connection(s, url: str, timeout_s: float) -> None:
+    """Dispatch connection pre-warm in the background and never wait for it."""
+    def _worker():
+        try:
+            s.warm_connection(url, timeout=timeout_s, quiet=True)
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_worker, daemon=True, name="connection-prewarm")
+    t.start()
+    logging.info(
+        "[warm] Fire-and-forget connection pre-warm dispatched, timeout=%dms",
+        int(max(0.001, float(timeout_s)) * 1000),
+    )
+
+
 from utils import AES_Decrypt, reserve, get_user_credentials
 from utils.reserve import CredentialRejectedError
+from utils.time_utils import (
+    infer_use_custom_day,
+    normalize_day_offset,
+    parse_times_range,
+    resolve_request_day,
+)
 
 
 def _now(action: bool) -> datetime.datetime:
@@ -140,10 +163,64 @@ def _pick_ordered_fallback_seat(
     return formatted_seat, formatted_offset
 
 
+def _normalize_backup_slots(raw_slots) -> list[dict]:
+    if isinstance(raw_slots, str):
+        result = []
+        for token in raw_slots.split(","):
+            token = token.strip()
+            if not token or "-" not in token:
+                continue
+            roomid, seatid = token.split("-", 1)
+            roomid = roomid.strip()
+            seatid = seatid.strip()
+            if not roomid or not seatid:
+                continue
+            result.append(
+                {
+                    "roomid": roomid,
+                    "seatid": seatid,
+                    "seatPageId": roomid,
+                    "fidEnc": "",
+                }
+            )
+        return result
+    if not isinstance(raw_slots, list):
+        return []
+    result = []
+    for item in raw_slots:
+        if not isinstance(item, dict):
+            continue
+        roomid = str(item.get("roomid") or item.get("r") or "").strip()
+        seatid = str(item.get("seatid") or item.get("s") or "").strip()
+        if not roomid or not seatid:
+            continue
+        result.append(
+            {
+                "roomid": roomid,
+                "seatid": seatid,
+                "seatPageId": str(item.get("seatPageId") or item.get("p") or roomid).strip(),
+                "fidEnc": str(item.get("fidEnc") or item.get("f") or "").strip(),
+            }
+        )
+    return result
+
+
+def _getusedtimes_conflict_ready(handle) -> bool | None:
+    if not isinstance(handle, dict):
+        return None
+    event = handle.get("event")
+    if event is None or not event.is_set():
+        return None
+    conflict = handle.get("conflict")
+    return conflict if isinstance(conflict, bool) else None
+
+
 ENDTIME = "21:30:40"  # 根据学校的预约座位时间+40ms即可
 WARM_CONNECTION_LEAD_MS = 2400  # 连接预热提前量（毫秒）
+TEXTCLICK_FIRST_CAPTCHA_GUARD_MS = 50  # 首枪选字验证码最晚补齐时间：target_dt 前多少毫秒
 FIRST_TOKEN_DATE_MODE = "submit_date"  # 首次取 token 的日期：today 或 submit_date
 RESERVE_NEXT_DAY = True  # 预约明天而不是今天的
+RESERVE_DAY_OFFSET = None  # 可选：覆盖提交参数 day 的北京时间日期偏移，2 表示后天
 ENABLE_SLIDER = False  # 是否有滑块验证（调试阶段先关闭）
 ENABLE_TEXTCLICK = False  # 是否有选字验证码（需要图灵云打码平台）
 SEAT_API_MODE = "seat"  # 选座接口模式：auto / seatengine / seat
@@ -167,18 +244,7 @@ MAX_SEAT_INCREMENT_ATTEMPTS = 10
 
 def _normalize_times(times):
     """把 times 统一成 [start, end] 结构。"""
-    if isinstance(times, list) and len(times) >= 2:
-        return [str(times[0]).strip(), str(times[1]).strip()]
-    if isinstance(times, tuple) and len(times) >= 2:
-        return [str(times[0]).strip(), str(times[1]).strip()]
-    if isinstance(times, str):
-        s = times.strip()
-        for sep in ["-", "~", "至"]:
-            if sep in s:
-                parts = [p.strip() for p in s.split(sep, 1)]
-                if len(parts) == 2 and parts[0] and parts[1]:
-                    return parts
-    return times
+    return parse_times_range(times)
 
 
 def _load_runtime_config(config_path, dispatch_mode, action):
@@ -200,7 +266,10 @@ def _load_runtime_config(config_path, dispatch_mode, action):
             if roomid and times:
                 slots = [{"roomid": roomid, "seatid": seatid, "times": times,
                           "seatPageId": payload.get("seatPageId") or "",
-                          "fidEnc": payload.get("fidEnc") or ""}]
+                          "fidEnc": payload.get("fidEnc") or "",
+                          "backupSeats": payload.get("backupSeats") or "",
+                          "backupSlots": payload.get("backupSlots") or [],
+                          "use_custom_day": payload.get("use_custom_day", False)}]
             else:
                 slots = []
 
@@ -216,14 +285,21 @@ def _load_runtime_config(config_path, dispatch_mode, action):
         for slot in slots:
             seatid = slot.get("seatid")
             times = _normalize_times(slot.get("times"))
+            use_custom_day = infer_use_custom_day(
+                times,
+                slot.get("use_custom_day", payload.get("use_custom_day", False)),
+            )
             reserve_list.append({
                 "username": username,
                 "password": decrypted_password,
                 "times": times,
+                "use_custom_day": use_custom_day,
                 "roomid": slot.get("roomid"),
                 "seatid": seatid if isinstance(seatid, list) else [seatid],
                 "seatPageId": slot.get("seatPageId") or "",
                 "fidEnc": slot.get("fidEnc") or "",
+                "backupSeats": slot.get("backupSeats") or "",
+                "backupSlots": slot.get("backupSlots") or [],
                 "daysofweek": [current_day],
             })
 
@@ -233,6 +309,7 @@ def _load_runtime_config(config_path, dispatch_mode, action):
             "endtime": payload.get("endtime", ENDTIME),
             "seat_api_mode": payload.get("seat_api_mode", SEAT_API_MODE),
             "reserve_next_day": payload.get("reserve_next_day", RESERVE_NEXT_DAY),
+            "reserve_day_offset": payload.get("reserve_day_offset"),
             "enable_slider": payload.get("enable_slider", ENABLE_SLIDER),
             "enable_textclick": payload.get("enable_textclick", ENABLE_TEXTCLICK),
             "relogin_every_loop": False,
@@ -240,6 +317,21 @@ def _load_runtime_config(config_path, dispatch_mode, action):
 
     with open(config_path, "r+") as data:
         return json.load(data)
+
+
+def _parse_int_range(value, fallback):
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        try:
+            return int(value[0]), int(value[1])
+        except (TypeError, ValueError):
+            return fallback, fallback
+    if isinstance(value, str) and "," in value:
+        parts = value.split(",", 1)
+        try:
+            return int(parts[0].strip()), int(parts[1].strip())
+        except (TypeError, ValueError):
+            return fallback, fallback
+    return fallback, fallback
 
 
 def _apply_strategy_config(config):
@@ -258,12 +350,15 @@ def _apply_strategy_config(config):
     global TOKEN_FETCH_DELAY_MS
     global FAST_PROBE_START_OFFSET_MS
     global WARM_CONNECTION_LEAD_MS
+    global TEXTCLICK_FIRST_CAPTCHA_GUARD_MS
     global FIRST_TOKEN_DATE_MODE
     global SEAT_API_MODE
+    global RESERVE_DAY_OFFSET
 
     strategy_cfg = config.get("strategy", {})
     ENDTIME = config.get("endtime", ENDTIME)
     RESERVE_NEXT_DAY = bool(config.get("reserve_next_day", RESERVE_NEXT_DAY))
+    RESERVE_DAY_OFFSET = normalize_day_offset(config.get("reserve_day_offset", None))
     ENABLE_SLIDER = bool(config.get("enable_slider", ENABLE_SLIDER))
     ENABLE_TEXTCLICK = bool(config.get("enable_textclick", ENABLE_TEXTCLICK))
     seat_api_mode = str(config.get("seat_api_mode", SEAT_API_MODE)).strip().lower()
@@ -271,19 +366,56 @@ def _apply_strategy_config(config):
         seat_api_mode if seat_api_mode in {"auto", "seatengine", "seat"} else "auto"
     )
     os.environ["CX_SEAT_API_MODE"] = SEAT_API_MODE
-    STRATEGY_LOGIN_LEAD_SECONDS = int(strategy_cfg.get("login_lead_seconds", 20))
-    STRATEGY_SLIDER_LEAD_SECONDS = int(strategy_cfg.get("slider_lead_seconds", 14))
+    if "login_lead_seconds" in strategy_cfg:
+        STRATEGY_LOGIN_LEAD_SECONDS = int(strategy_cfg.get("login_lead_seconds", 20))
+    else:
+        login_lead_min, login_lead_max = _parse_int_range(
+            strategy_cfg.get("login_lead_seconds_range"),
+            20,
+        )
+        STRATEGY_LOGIN_LEAD_SECONDS = random.randint(
+            min(login_lead_min, login_lead_max),
+            max(login_lead_min, login_lead_max),
+        )
+    if "slider_lead_seconds" in strategy_cfg:
+        STRATEGY_SLIDER_LEAD_SECONDS = int(strategy_cfg.get("slider_lead_seconds", 14))
+    else:
+        slider_lead_min, slider_lead_max = _parse_int_range(
+            strategy_cfg.get("slider_lead_seconds_range"),
+            14,
+        )
+        STRATEGY_SLIDER_LEAD_SECONDS = random.randint(
+            min(slider_lead_min, slider_lead_max),
+            max(slider_lead_min, slider_lead_max),
+        )
     STRATEGIC_MODE = strategy_cfg.get("mode", "B")
     PRE_FETCH_TOKEN_MS = int(strategy_cfg.get("pre_fetch_token_ms", 3000))
     FIRST_SUBMIT_OFFSET_MS = int(strategy_cfg.get("first_submit_offset_ms", 89))
     SUBMIT_MODE = strategy_cfg.get("submit_mode", "serial")
     BURST_OFFSETS_MS = strategy_cfg.get("burst_offsets_ms", [120, 420, 820])
     TOKEN_FETCH_DELAY_MS = int(strategy_cfg.get("token_fetch_delay_ms", 50))
+    token_fetch_timeout_ms = max(
+        1,
+        int(strategy_cfg.get("token_fetch_timeout_ms", 2830)),
+    )
+    fast_probe_timeout_ms = max(
+        1,
+        int(strategy_cfg.get("fast_probe_timeout_ms", 2830)),
+    )
+    os.environ["CX_TOKEN_FETCH_TIMEOUT_MS"] = str(token_fetch_timeout_ms)
+    os.environ["CX_FAST_PROBE_CONNECT_TIMEOUT"] = f"{fast_probe_timeout_ms / 1000.0:g}"
+    os.environ["CX_FAST_PROBE_READ_TIMEOUT"] = f"{fast_probe_timeout_ms / 1000.0:g}"
     FAST_PROBE_START_OFFSET_MS = int(
         strategy_cfg.get("fast_probe_start_offset_ms", FAST_PROBE_START_OFFSET_MS)
     )
     WARM_CONNECTION_LEAD_MS = int(
         strategy_cfg.get("warm_connection_lead_ms", WARM_CONNECTION_LEAD_MS)
+    )
+    TEXTCLICK_FIRST_CAPTCHA_GUARD_MS = int(
+        strategy_cfg.get(
+            "textclick_first_captcha_guard_ms",
+            TEXTCLICK_FIRST_CAPTCHA_GUARD_MS,
+        )
     )
     first_token_date_mode = str(
         strategy_cfg.get("first_token_date_mode", FIRST_TOKEN_DATE_MODE)
@@ -306,7 +438,8 @@ def _get_first_token_day(
 
 def _get_beijing_target_from_endtime() -> datetime.datetime:
     """根据 ENDTIME 计算目标时间（北京时间，当天 ENDTIME 减 40 秒）。"""
-    today = _beijing_now().date()
+    now = _beijing_now()
+    today = now.date()
     h, m, s = map(int, ENDTIME.split(":"))
     end_dt = datetime.datetime(
         year=today.year,
@@ -317,8 +450,15 @@ def _get_beijing_target_from_endtime() -> datetime.datetime:
         second=s,
         tzinfo=ZoneInfo("Asia/Shanghai"),
     )
+    if end_dt < now and now - end_dt > datetime.timedelta(hours=12):
+        end_dt += datetime.timedelta(days=1)
     return end_dt - datetime.timedelta(seconds=40)
     # return end_dt - datetime.timedelta(minutes=1)  # ENDTIME 前 1 分钟（60秒）
+
+
+def _get_beijing_end_dt_from_target(target_dt: datetime.datetime) -> datetime.datetime:
+    """返回本轮预约窗口的结束时刻，支持 ENDTIME 跨午夜。"""
+    return target_dt + datetime.timedelta(seconds=40)
 
 
 def _get_strategy_login_deadline(target_dt: datetime.datetime) -> datetime.datetime:
@@ -335,6 +475,23 @@ def _get_strategy_login_deadline(target_dt: datetime.datetime) -> datetime.datet
             TOKEN_FETCH_DELAY_MS,
         )
     return target_dt + datetime.timedelta(milliseconds=max_offset_ms + 500)
+
+
+def _get_first_token_start_dt(target_dt: datetime.datetime) -> datetime.datetime:
+    """返回战略流程中首个探测/正式 token 请求最早可能启动的时间。"""
+    if SUBMIT_MODE == "burst":
+        if STRATEGIC_MODE == "A":
+            return target_dt - datetime.timedelta(milliseconds=PRE_FETCH_TOKEN_MS)
+        if STRATEGIC_MODE == "C":
+            return target_dt + datetime.timedelta(milliseconds=FAST_PROBE_START_OFFSET_MS)
+        first_offset = min(BURST_OFFSETS_MS or [FIRST_SUBMIT_OFFSET_MS])
+        return target_dt + datetime.timedelta(milliseconds=first_offset)
+
+    if STRATEGIC_MODE == "A":
+        return target_dt - datetime.timedelta(milliseconds=PRE_FETCH_TOKEN_MS)
+    if STRATEGIC_MODE == "C":
+        return target_dt + datetime.timedelta(milliseconds=FAST_PROBE_START_OFFSET_MS)
+    return target_dt + datetime.timedelta(milliseconds=FIRST_SUBMIT_OFFSET_MS)
 
 
 def _probe_then_get_page_token(
@@ -408,10 +565,37 @@ def _probe_then_get_page_token(
     )
 
 
+def _get_page_token_until_success(
+    s,
+    token_url: str,
+    *,
+    require_value: bool = True,
+    retry_until: datetime.datetime | None = None,
+    retry_interval: float = 0.005,
+    label: str = "token",
+):
+    """正式获取页面 token；空 token 视为失败并持续刷新到 retry_until。"""
+    logging.info(
+        f"[strategic] {label}: start formal token fetch from {token_url}"
+        + (f", retry until {retry_until}" if retry_until else "")
+    )
+    token, value = s._get_page_token(
+        token_url,
+        require_value=require_value,
+        not_open_retry_until=retry_until,
+        not_open_retry_interval=retry_interval,
+    )
+    if token:
+        logging.info(f"[strategic] {label}: got token from {token_url}: {token}")
+    else:
+        logging.error(f"[strategic] {label}: token is empty after formal fetch")
+    return token, value
+
+
 def _burst_shot_worker(
     index, offset_ms, target_dt, s, token_url,
     times, roomid, seatid, captcha, action, results,
-    pre_token="", pre_value=""
+    pre_token="", pre_value="", use_custom_day=False, day="", fid_enc=""
 ):
     """定时连发（极限型）的单次提交工作线程。
 
@@ -425,6 +609,13 @@ def _burst_shot_worker(
     logging.info(
         f"[burst] Shot {index + 1} firing at {_beijing_now()} (target_dt + {offset_ms}ms)"
     )
+
+    if (ENABLE_SLIDER or ENABLE_TEXTCLICK) and not captcha:
+        logging.error(
+            f"[burst] Shot {index + 1} has empty captcha, skip submit to avoid empty captcha"
+        )
+        results[index] = False
+        return
 
     if pre_token:
         token, value = pre_token, pre_value
@@ -443,6 +634,13 @@ def _burst_shot_worker(
         logging.info(
             f"[burst] Shot {index + 1} fetched token on-the-fly from {token_url}: {token}"
         )
+        s.post_getusedtimes_after_token(
+            times,
+            roomid,
+            seatid,
+            day,
+            fid_enc=fid_enc,
+        )
 
     result = s.get_submit(
         url=s.submit_url,
@@ -453,6 +651,8 @@ def _burst_shot_worker(
         captcha=captcha,
         action=action,
         value=value,
+        dept_id_enc=fid_enc,
+        use_custom_day=use_custom_day,
     )
     results[index] = result
     logging.info(f"[burst] Shot {index + 1} result: {result}")
@@ -500,6 +700,20 @@ def strategic_first_attempt(
     warm_done = False
     shared_strategy_session = None
     shared_strategy_username = None
+    claimed_backup_seats = set()
+    strategic_primary_seats = set()
+    for candidate_user in users:
+        if current_dayofweek not in candidate_user.get("daysofweek", []):
+            continue
+        candidate_room = str(candidate_user.get("roomid") or "").strip()
+        candidate_seats = candidate_user.get("seatid")
+        candidate_seat_list = (
+            [candidate_seats]
+            if isinstance(candidate_seats, str)
+            else (candidate_seats if isinstance(candidate_seats, list) else [])
+        )
+        if candidate_room and candidate_seat_list:
+            strategic_primary_seats.add((candidate_room, str(candidate_seat_list[0]).strip()))
     not_open_retry_until = target_dt + datetime.timedelta(milliseconds=FAST_PROBE_DEADLINE_MS)
 
     for index, user in enumerate(users):
@@ -514,6 +728,7 @@ def strategic_first_attempt(
         seatid = user["seatid"]
         seat_page_id = user.get("seatPageId")
         fid_enc = user.get("fidEnc")
+        use_custom_day = bool(user.get("use_custom_day"))
         daysofweek = user["daysofweek"]
 
         # 今天不预约该配置，跳过
@@ -542,13 +757,69 @@ def strategic_first_attempt(
             continue
 
         logging.info(
-            f"[strategic] Start first attempt for {username} -- {times} -- {seat_list} -- seatPageId={seat_page_id} -- fidEnc={fid_enc}"
+            f"[strategic] Start first attempt for {username} -- {times} -- {seat_list} "
+            f"-- seatPageId={seat_page_id} -- fidEnc={fid_enc} -- use_custom_day={use_custom_day}"
         )
 
         first_seat = seat_list[0]
-        warm_day = _beijing_now().date()
-        submit_day = warm_day + datetime.timedelta(days=1 if RESERVE_NEXT_DAY else 0)
+        backup_slots = _normalize_backup_slots(user.get("backupSeats") or user.get("backupSlots"))
+        submit_day = resolve_request_day(
+            times,
+            RESERVE_NEXT_DAY,
+            use_custom_day=use_custom_day,
+            reserve_day_offset=RESERVE_DAY_OFFSET,
+        )
+        warm_day = str(_beijing_now().date())
+        first_token_day = submit_day
+        if not use_custom_day:
+            first_token_day = str(
+                _get_first_token_day(
+                    _beijing_now().date(),
+                    datetime.date.fromisoformat(submit_day),
+                )
+            )
         captcha1 = captcha2 = captcha3 = ""
+        live_captcha_results = None
+        textclick_preheat_thread = None
+
+        def _resolve_textclick_with_retries(
+            captcha_session,
+            label: str,
+            *,
+            max_retries: int | None = 3,
+            deadline_func=None,
+        ) -> str:
+            attempt = 0
+            while max_retries is None or attempt < max_retries:
+                attempt += 1
+                if deadline_func is not None and deadline_func() <= 0:
+                    logging.warning(
+                        f"[strategic] Textclick {label} stopped before success: preheat deadline reached"
+                    )
+                    return ""
+                try:
+                    captcha = captcha_session.resolve_captcha("textclick") or ""
+                except Exception as e:
+                    logging.debug(f"[strategic] Textclick {label} attempt {attempt} raised: {e}")
+                    captcha = ""
+                if captcha:
+                    logging.info(
+                        f"[strategic] Textclick {label} resolved on attempt {attempt}"
+                    )
+                    return captcha
+                if max_retries is None or attempt < max_retries:
+                    if deadline_func is None:
+                        time.sleep(0.2)
+                    else:
+                        sleep_s = min(0.2, max(0.0, deadline_func()))
+                        if sleep_s > 0:
+                            time.sleep(sleep_s)
+
+            logging.warning(
+                f"[strategic] Textclick {label} failed after {max_retries} attempts"
+            )
+            return ""
+
         is_primary_strategy_config = shared_strategy_session is None
         if is_primary_strategy_config:
             # 1. 只有首个配置执行登录和预热；后续配置直接复用这个登录态。
@@ -558,6 +829,7 @@ def strategic_first_attempt(
                 enable_slider=ENABLE_SLIDER,
                 enable_textclick=ENABLE_TEXTCLICK,
                 reserve_next_day=RESERVE_NEXT_DAY,
+                reserve_day_offset=RESERVE_DAY_OFFSET,
             )
             login_deadline = _get_strategy_login_deadline(target_dt)
             login_ok = False
@@ -592,7 +864,7 @@ def strategic_first_attempt(
             s.set_captcha_context(
                 roomid=roomid,
                 seat_num=first_seat,
-                day=str(submit_day),
+                day=submit_day,
                 seat_page_id=seat_page_id,
                 fid_enc=fid_enc,
             )
@@ -600,8 +872,12 @@ def strategic_first_attempt(
             shared_strategy_username = username
 
             # 验证码预热整体预算：最多占用 [T-slider_lead_seconds, T] 这段时间。
-            # 到达 target_dt 后立即停止预热，直接进入提交流程。
+            # 选字验证码需要先为连接预热让出时间，后面会在首枪取 token 前再做一次硬保证。
             captcha_deadline = target_dt
+            if ENABLE_TEXTCLICK and WARM_CONNECTION_LEAD_MS > 0:
+                captcha_deadline = target_dt - datetime.timedelta(
+                    milliseconds=WARM_CONNECTION_LEAD_MS
+                )
 
             def _remaining_captcha_seconds() -> float:
                 return (captcha_deadline - _beijing_now()).total_seconds()
@@ -625,13 +901,14 @@ def strategic_first_attempt(
                         enable_slider=ENABLE_SLIDER,
                         enable_textclick=ENABLE_TEXTCLICK,
                         reserve_next_day=RESERVE_NEXT_DAY,
+                        reserve_day_offset=RESERVE_DAY_OFFSET,
                     )
                     worker.requests.cookies.update(s.requests.cookies)
                     worker.requests.headers.update(s.requests.headers)
                     worker.set_captcha_context(
                         roomid=roomid,
                         seat_num=first_seat,
-                        day=str(submit_day),
+                        day=submit_day,
                         seat_page_id=seat_page_id,
                         fid_enc=fid_enc,
                     )
@@ -650,6 +927,7 @@ def strategic_first_attempt(
                     return captcha
 
                 captcha_results = {1: "", 2: "", 3: ""}
+                live_captcha_results = captcha_results
                 remaining = _remaining_captcha_seconds()
                 if remaining <= 0:
                     logging.warning("[strategic] Captcha preheat budget exhausted before slider starts, skip preheat")
@@ -714,120 +992,73 @@ def strategic_first_attempt(
                 logging.info(f"[strategic] Pre-resolved slider captcha2: {captcha2}")
                 logging.info(f"[strategic] Pre-resolved slider captcha3: {captcha3}")
             elif ENABLE_TEXTCLICK:
-                def _resolve_textclick_captcha_parallel(slot_idx: int, max_retries: int = 3) -> str:
-                    for i in range(max_retries):
-                        if _remaining_captcha_seconds() <= 0:
-                            logging.warning(
-                                f"[strategic] Textclick captcha{slot_idx} skipped: preheat deadline reached"
-                            )
-                            return ""
-
+                captcha_results = {1: "", 2: "", 3: ""}
+                live_captcha_results = captcha_results
+                remaining = _remaining_captcha_seconds()
+                if remaining <= 0:
+                    logging.warning("[strategic] Captcha preheat budget exhausted before textclick starts, skip preheat")
+                else:
+                    def _make_textclick_worker():
                         worker = reserve(
                             sleep_time=SLEEPTIME,
                             max_attempt=MAX_ATTEMPT,
                             enable_slider=ENABLE_SLIDER,
                             enable_textclick=ENABLE_TEXTCLICK,
                             reserve_next_day=RESERVE_NEXT_DAY,
+                            reserve_day_offset=RESERVE_DAY_OFFSET,
                         )
                         worker.requests.cookies.update(s.requests.cookies)
                         worker.requests.headers.update(s.requests.headers)
                         worker.set_captcha_context(
                             roomid=roomid,
                             seat_num=first_seat,
-                            day=str(submit_day),
+                            day=submit_day,
                             seat_page_id=seat_page_id,
                             fid_enc=fid_enc,
                         )
+                        return worker
 
-                        captcha = worker.resolve_captcha("textclick")
-                        if captcha:
-                            logging.info(
-                                f"[strategic] Textclick captcha{slot_idx} resolved on attempt {i + 1}"
-                            )
-                            return captcha
-
-                        logging.warning(
-                            f"[strategic] Textclick captcha{slot_idx} failed on attempt "
-                            f"{i + 1}/{max_retries}, retrying"
-                        )
-                        time.sleep(0.2)
-
-                    logging.error(
-                        f"[strategic] Textclick captcha{slot_idx} failed after {max_retries} retries"
-                    )
-                    return ""
-
-                captcha_results = {1: "", 2: "", 3: ""}
-                remaining = _remaining_captcha_seconds()
-                if remaining <= 0:
-                    logging.warning("[strategic] Captcha preheat budget exhausted before textclick starts, skip preheat")
-                else:
-                    def _worker(slot_idx: int):
+                    def _worker():
                         try:
-                            captcha_results[slot_idx] = _resolve_textclick_captcha_parallel(slot_idx) or ""
+                            captcha_results[1] = _resolve_textclick_with_retries(
+                                _make_textclick_worker(),
+                                "preheat captcha1",
+                                max_retries=None,
+                                deadline_func=_remaining_captcha_seconds,
+                            ) or ""
                         except Exception as e:
-                            logging.warning(f"[strategic] Textclick captcha{slot_idx} thread failed: {e}")
-                            captcha_results[slot_idx] = ""
+                            logging.warning(f"[strategic] Textclick captcha1 preheat thread failed: {e}")
+                            captcha_results[1] = ""
 
                     deadline_mono = time.monotonic() + remaining
-
-                    def _start_threads(slot_ids: list[int]):
-                        local_threads = []
-                        for idx in slot_ids:
-                            t = threading.Thread(
-                                target=_worker,
-                                args=(idx,),
-                                name=f"textclick-captcha-{idx}",
-                                daemon=True,
-                            )
-                            local_threads.append((idx, t))
-                            t.start()
-                        return local_threads
-
-                    def _join_threads_until_deadline(threads_to_join):
-                        for _, t in threads_to_join:
-                            timeout_left = deadline_mono - time.monotonic()
-                            if timeout_left <= 0:
-                                break
-                            t.join(timeout=timeout_left)
-
-                    if remaining < 3:
-                        logging.warning(
-                            "[strategic] Remaining captcha preheat budget < 3s, preheat textclick captcha1/2 first"
-                        )
-                        first_two_threads = _start_threads([1, 2])
-                        _join_threads_until_deadline(first_two_threads)
-
-                        ready_count = sum(1 for i in [1, 2] if captcha_results[i])
-                        if ready_count >= 1:
-                            logging.warning(
-                                "[strategic] Budget < 3s and textclick captcha1/2 already ready, skip captcha3 preheat"
-                            )
-                        else:
-                            timeout_left = deadline_mono - time.monotonic()
-                            if timeout_left > 0:
-                                logging.warning(
-                                    "[strategic] Budget < 3s and textclick captcha1/2 empty, try captcha3 as fallback"
-                                )
-                                third_threads = _start_threads([3])
-                                _join_threads_until_deadline(third_threads)
-                    else:
-                        all_threads = _start_threads([1, 2, 3])
-                        _join_threads_until_deadline(all_threads)
+                    logging.info(
+                        "[strategic] Preheat textclick captcha1 until it has validate "
+                        "or reaches the pre-warm hard deadline"
+                    )
+                    textclick_preheat_thread = threading.Thread(
+                        target=_worker,
+                        name="textclick-captcha-1",
+                        daemon=True,
+                    )
+                    textclick_preheat_thread.start()
+                    timeout_left = deadline_mono - time.monotonic()
+                    if timeout_left > 0:
+                        textclick_preheat_thread.join(timeout=timeout_left)
 
                 captcha1 = captcha_results[1]
-                captcha2 = captcha_results[2]
-                captcha3 = captcha_results[3]
-                logging.info(f"[strategic] Pre-resolved textclick captcha1: {captcha1}")
-                logging.info(f"[strategic] Pre-resolved textclick captcha2: {captcha2}")
-                logging.info(f"[strategic] Pre-resolved textclick captcha3: {captcha3}")
+                captcha2 = ""
+                captcha3 = ""
+                logging.info(
+                    "[strategic] Pre-resolved textclick captcha ready: %s",
+                    bool(captcha1),
+                )
         else:
             s = shared_strategy_session
             s.requests.headers.update({"Host": "office.chaoxing.com"})
             s.set_captcha_context(
                 roomid=roomid,
                 seat_num=first_seat,
-                day=str(submit_day),
+                day=submit_day,
                 seat_page_id=seat_page_id,
                 fid_enc=fid_enc,
             )
@@ -844,40 +1075,423 @@ def strategic_first_attempt(
                 captcha3 = s.resolve_captcha("slide") or ""
             elif ENABLE_TEXTCLICK:
                 logging.info(
-                    "[strategic] Captcha preheat skipped for this config; resolve textclick captchas on demand"
+                    "[strategic] Captcha preheat skipped for this config; resolve one textclick captcha first"
                 )
-                captcha1 = s.resolve_captcha("textclick") or ""
-                captcha2 = s.resolve_captcha("textclick") or ""
-                captcha3 = s.resolve_captcha("textclick") or ""
+                captcha1 = _resolve_textclick_with_retries(
+                    s,
+                    "reuse-session captcha1",
+                    max_retries=3,
+                ) or ""
+                captcha2 = ""
+                captcha3 = ""
+
+        captcha_required = bool(ENABLE_SLIDER or ENABLE_TEXTCLICK)
+        captcha_type = "slide" if ENABLE_SLIDER else "textclick"
+        raw_captchas = [captcha1, captcha2, captcha3]
+        if ENABLE_TEXTCLICK and captcha1:
+            captchas_for_submit = [captcha1, captcha1, captcha1]
+            logging.info(
+                "[strategic] Reuse one preheated textclick captcha for the first three submits"
+            )
+        else:
+            captchas_for_submit = [captcha for captcha in raw_captchas if captcha]
+        expected_single_textclick = bool(
+            ENABLE_TEXTCLICK
+            and captchas_for_submit
+            and raw_captchas[0]
+            and not raw_captchas[1]
+            and not raw_captchas[2]
+        )
+        if captcha_required and captchas_for_submit != raw_captchas and not expected_single_textclick:
+            logging.warning(
+                "[strategic] Normalize captcha submit order to avoid empty captcha: "
+                f"raw={raw_captchas}, non_empty_count={len(captchas_for_submit)}"
+            )
+        elif expected_single_textclick:
+            logging.info(
+                "[strategic] Textclick submit order uses one prepared captcha for "
+                "the first three submits"
+            )
+        captchas_for_submit = (captchas_for_submit + ["", "", ""])[:3]
+        captcha1, captcha2, captcha3 = captchas_for_submit
+        if captcha_required:
+            logging.info(
+                "[strategic] Captcha submit order after normalization: "
+                f"captcha1={captcha1}, captcha2={captcha2}, captcha3={captcha3}"
+            )
+
+        def _refresh_submit_captchas_from_live_results():
+            if not captcha_required or not live_captcha_results:
+                return
+
+            if ENABLE_TEXTCLICK:
+                live_first = live_captcha_results.get(1, "")
+                if live_first and not captchas_for_submit[0]:
+                    captchas_for_submit[:] = [live_first, live_first, live_first]
+                    logging.info(
+                        "[strategic] Refreshed reused textclick captcha from late preheat result"
+                    )
+                return
+
+            live_captchas = [
+                live_captcha_results.get(1, ""),
+                live_captcha_results.get(2, ""),
+                live_captcha_results.get(3, ""),
+            ]
+            merged = []
+            seen = set()
+            for captcha in captchas_for_submit + live_captchas:
+                if captcha and captcha not in seen:
+                    merged.append(captcha)
+                    seen.add(captcha)
+
+            refreshed = (merged + ["", "", ""])[:3]
+            if refreshed != captchas_for_submit:
+                captchas_for_submit[:] = refreshed
+                logging.info(
+                    "[strategic] Refreshed captcha submit order from late preheat results: "
+                    f"live={live_captchas}, captcha1={captchas_for_submit[0]}, "
+                    f"captcha2={captchas_for_submit[1]}, captcha3={captchas_for_submit[2]}"
+                )
+
+        def _prepare_textclick_captcha_for_submit(
+            shot_idx: int,
+            reason: str,
+            *,
+            max_retries: int | None = 3,
+        ):
+            if not ENABLE_TEXTCLICK:
+                return
+
+            _refresh_submit_captchas_from_live_results()
+            list_idx = shot_idx - 1
+            if not (0 <= list_idx < len(captchas_for_submit)):
+                return
+
+            logging.info(
+                f"[strategic] {reason}; immediately resolve a fresh textclick captcha "
+                f"for submit shot {shot_idx} and replace the reused preheated captcha"
+            )
+            captcha = _resolve_textclick_with_retries(
+                s,
+                f"submit shot {shot_idx}",
+                max_retries=max_retries,
+            ) or ""
+            if captcha:
+                captchas_for_submit[list_idx] = captcha
+            else:
+                logging.warning(
+                    f"[strategic] Failed to prepare textclick captcha for submit shot {shot_idx}"
+                )
+
+        def _last_submit_failure_msg() -> str:
+            if not isinstance(s.last_submit_result, dict):
+                return ""
+            return str(s.last_submit_result.get("msg", ""))
+
+        def _last_submit_failed_by_captcha() -> bool:
+            msg = _last_submit_failure_msg()
+            return "验证码" in msg or "captcha" in msg.lower()
+
+        def _get_submit_captcha(shot_idx: int) -> str | None:
+            if not captcha_required:
+                return ""
+
+            _refresh_submit_captchas_from_live_results()
+            list_idx = shot_idx - 1
+            captcha = (
+                captchas_for_submit[list_idx]
+                if 0 <= list_idx < len(captchas_for_submit)
+                else ""
+            )
+            if captcha:
+                return captcha
+
+            if ENABLE_TEXTCLICK and shot_idx == 1:
+                logging.error(
+                    "[strategic] Textclick captcha1 is still empty when submit shot 1 needs it; "
+                    "skip this strategic submit instead of resolving after token fetch"
+                )
+                return None
+
+            logging.warning(
+                f"[strategic] Captcha for submit shot {shot_idx} is empty, "
+                f"resolve {captcha_type} captcha on demand before submit"
+            )
+            if ENABLE_TEXTCLICK:
+                captcha = _resolve_textclick_with_retries(
+                    s,
+                    f"submit shot {shot_idx} fallback",
+                    max_retries=3,
+                ) or ""
+            else:
+                captcha = s.resolve_captcha(captcha_type) or ""
+            if captcha:
+                if 0 <= list_idx < len(captchas_for_submit):
+                    captchas_for_submit[list_idx] = captcha
+                logging.info(
+                    f"[strategic] On-demand {captcha_type} captcha for submit shot "
+                    f"{shot_idx}: {captcha}"
+                )
+                return captcha
+
+            logging.error(
+                f"[strategic] Submit shot {shot_idx} has no captcha after on-demand "
+                "resolve, skip submit to avoid empty captcha"
+            )
+            return None
+
+        def _ensure_textclick_captcha1_before_strategic_token() -> bool:
+            if not ENABLE_TEXTCLICK:
+                return True
+
+            _refresh_submit_captchas_from_live_results()
+            if captchas_for_submit[0]:
+                return True
+
+            guard_ms = max(0, TEXTCLICK_FIRST_CAPTCHA_GUARD_MS)
+            hard_deadline = target_dt - datetime.timedelta(milliseconds=guard_ms)
+
+            if _beijing_now() < hard_deadline:
+                logging.warning(
+                    "[strategic] Textclick captcha1 empty before token stage; "
+                    f"continue resolving until {hard_deadline} before fetching token"
+                )
+
+                if (
+                    textclick_preheat_thread is not None
+                    and textclick_preheat_thread.is_alive()
+                ):
+                    wait_s = max(0.0, (hard_deadline - _beijing_now()).total_seconds())
+                    logging.info(
+                        "[strategic] Textclick preheat thread is still running; "
+                        "wait for existing captcha request before starting another"
+                    )
+                    textclick_preheat_thread.join(timeout=wait_s)
+                    _refresh_submit_captchas_from_live_results()
+                    if captchas_for_submit[0]:
+                        logging.info(
+                            "[strategic] Textclick captcha1 received from existing "
+                            "preheat thread before strategic token fetch"
+                        )
+                        return True
+
+                def _remaining_first_captcha_seconds() -> float:
+                    return (hard_deadline - _beijing_now()).total_seconds()
+
+                captcha = _resolve_textclick_with_retries(
+                    s,
+                    "captcha1 pre-token guarantee",
+                    max_retries=None,
+                    deadline_func=_remaining_first_captcha_seconds,
+                ) or ""
+                if captcha:
+                    captchas_for_submit[0] = captcha
+
+            _refresh_submit_captchas_from_live_results()
+            if captchas_for_submit[0]:
+                logging.info(
+                    "[strategic] Textclick captcha1 is ready before strategic token fetch"
+                )
+                return True
+
+            logging.error(
+                "[strategic] Textclick captcha1 is empty at the hard deadline; "
+                "skip strategic token fetch/submit to avoid post-token captcha resolving"
+            )
+            return False
 
         # 将已登录的 session 存入 sessions[]，fallback 直接复用，无需重新登录
         if sessions is not None and sessions[index] is None:
             sessions[index] = s
 
-        # 预热 URL 保持使用当天页面，只用于建立连接，不参与真正提交。
-        _warm_day = warm_day
+        # 连接预热始终使用当天页面；
+        # 自定义日期模式下，首次 token / submit 使用最终提交日；
+        # 普通时间段则保留原有 first_token_date_mode 逻辑。
         _warm_url = s.url.format(
             roomId=roomid,
-            day=str(_warm_day),
+            day=warm_day,
             seatPageId=seat_page_id or "",
             fidEnc=fid_enc or "",
         )
 
-        # 真正提交通常使用预约日页面；首次取 token 允许按策略改为当天页面。
-        _submit_day = submit_day
-        _first_token_day = _get_first_token_day(_warm_day, _submit_day)
         _first_token_url = s.url.format(
             roomId=roomid,
-            day=str(_first_token_day),
+            day=first_token_day,
             seatPageId=seat_page_id or "",
             fidEnc=fid_enc or "",
         )
         _submit_token_url = s.url.format(
             roomId=roomid,
-            day=str(_submit_day),
+            day=submit_day,
             seatPageId=seat_page_id or "",
             fidEnc=fid_enc or "",
         )
+
+        def _maybe_switch_to_backup(handle, token, value, label: str, shot_no: int):
+            if ENABLE_TEXTCLICK and isinstance(handle, dict):
+                event = handle.get("event")
+                if event is not None and not event.is_set():
+                    event.wait(timeout=0.5)
+            conflict = _getusedtimes_conflict_ready(handle)
+            if conflict is None:
+                logging.info(
+                    "[strategic] %s getusedtimes not ready before submit, keep primary seat %s/%s",
+                    label,
+                    roomid,
+                    first_seat,
+                )
+                return roomid, first_seat, seat_page_id, fid_enc, token, value
+            if conflict is False:
+                logging.info(
+                    "[strategic] %s primary seat %s/%s is not conflicted, keep primary",
+                    label,
+                    roomid,
+                    first_seat,
+                )
+                return roomid, first_seat, seat_page_id, fid_enc, token, value
+
+            for backup in backup_slots:
+                backup_room = backup["roomid"]
+                backup_seat = backup["seatid"]
+                backup_key = (backup_room, backup_seat)
+                if backup_key in claimed_backup_seats:
+                    continue
+                backup_page_id = backup.get("seatPageId") or backup_room
+                backup_fid = backup.get("fidEnc") or fid_enc
+                if ENABLE_TEXTCLICK:
+                    backup_conflict = s.check_getusedtimes_conflict_sync(
+                        times,
+                        backup_room,
+                        backup_seat,
+                        submit_day,
+                        fid_enc=backup_fid,
+                    )
+                    if backup_conflict is True:
+                        logging.info(
+                            "[strategic] %s backup %s/%s also conflicted, keep trying next backup",
+                            label,
+                            backup_room,
+                            backup_seat,
+                        )
+                        continue
+                claimed_backup_seats.add(backup_key)
+                logging.info(
+                    "[strategic] %s primary seat %s/%s conflicted, switch to backup %s/%s",
+                    label,
+                    roomid,
+                    first_seat,
+                    backup_room,
+                    backup_seat,
+                )
+                if backup_room != roomid or str(backup_page_id or "") != str(seat_page_id or ""):
+                    backup_token_url = s.url.format(
+                        roomId=backup_room,
+                        day=submit_day,
+                        seatPageId=backup_page_id or "",
+                        fidEnc=backup_fid or "",
+                    )
+                    backup_token, backup_value = s._get_page_token(
+                        backup_token_url,
+                        require_value=True,
+                    )
+                    if backup_token:
+                        return backup_room, backup_seat, backup_page_id, backup_fid, backup_token, backup_value
+                    logging.warning(
+                        "[strategic] %s backup %s/%s token fetch failed, keep trying next backup",
+                        label,
+                        backup_room,
+                        backup_seat,
+                    )
+                    continue
+                return backup_room, backup_seat, backup_page_id, backup_fid, token, value
+
+            fallback_base_room = roomid
+            fallback_base_seat = first_seat
+            fallback_page_id = seat_page_id
+            fallback_fid = fid_enc
+            if backup_slots:
+                last_backup = backup_slots[-1]
+                fallback_base_room = last_backup.get("roomid") or roomid
+                fallback_base_seat = last_backup.get("seatid") or first_seat
+                fallback_page_id = last_backup.get("seatPageId") or fallback_base_room
+                fallback_fid = last_backup.get("fidEnc") or fid_enc
+
+            try:
+                base_seat_num = int(str(fallback_base_seat).strip())
+            except (TypeError, ValueError):
+                base_seat_num = 0
+            for attempt_no in range(max(1, shot_no), MAX_SEAT_INCREMENT_ATTEMPTS + 1):
+                fallback_seat, offset = _pick_ordered_fallback_seat(base_seat_num, attempt_no)
+                fallback_key = (fallback_base_room, fallback_seat or "")
+                if not fallback_seat:
+                    continue
+                if fallback_key in strategic_primary_seats or fallback_key in claimed_backup_seats:
+                    logging.info(
+                        "[strategic] %s ordered fallback %s/%s skipped because it is already active/claimed",
+                        label,
+                        fallback_base_room,
+                        fallback_seat,
+                    )
+                    continue
+                if ENABLE_TEXTCLICK:
+                    fallback_conflict = s.check_getusedtimes_conflict_sync(
+                        times,
+                        fallback_base_room,
+                        fallback_seat,
+                        submit_day,
+                        fid_enc=fallback_fid,
+                    )
+                    if fallback_conflict is True:
+                        logging.info(
+                            "[strategic] %s ordered fallback %s/%s skipped because getusedtimes is conflicted",
+                            label,
+                            fallback_base_room,
+                            fallback_seat,
+                        )
+                        continue
+                claimed_backup_seats.add(fallback_key)
+                logging.info(
+                    "[strategic] %s primary seat %s/%s conflicted and %s, use ordered fallback from %s/%s -> %s/%s (%s)",
+                    label,
+                    roomid,
+                    first_seat,
+                    "backupSeats exhausted" if backup_slots else "backupSeats empty",
+                    fallback_base_room,
+                    fallback_base_seat,
+                    fallback_base_room,
+                    fallback_seat,
+                    offset,
+                )
+                if fallback_base_room != roomid or str(fallback_page_id or "") != str(seat_page_id or ""):
+                    fallback_token_url = s.url.format(
+                        roomId=fallback_base_room,
+                        day=submit_day,
+                        seatPageId=fallback_page_id or "",
+                        fidEnc=fallback_fid or "",
+                    )
+                    fallback_token, fallback_value = s._get_page_token(
+                        fallback_token_url,
+                        require_value=True,
+                    )
+                    if fallback_token:
+                        return fallback_base_room, fallback_seat, fallback_page_id, fallback_fid, fallback_token, fallback_value
+                    logging.warning(
+                        "[strategic] %s ordered fallback %s/%s token fetch failed, keep primary",
+                        label,
+                        fallback_base_room,
+                        fallback_seat,
+                    )
+                    continue
+                return fallback_base_room, fallback_seat, fallback_page_id, fallback_fid, token, value
+
+            logging.warning(
+                "[strategic] %s primary seat conflicted but no usable backupSeats, keep primary %s/%s",
+                label,
+                roomid,
+                first_seat,
+            )
+            return roomid, first_seat, seat_page_id, fid_enc, token, value
 
         # 连接预热：只有首个配置执行一次，后续配置直接复用已预热的连接池
         if is_primary_strategy_config and not warm_done:
@@ -886,13 +1500,53 @@ def strategic_first_attempt(
                     milliseconds=WARM_CONNECTION_LEAD_MS
                 )
                 _wait_until(warm_dt)
-                s.warm_connection(_warm_url)
-                warm_done = True
+                if ENABLE_TEXTCLICK:
+                    _refresh_submit_captchas_from_live_results()
+                    if (
+                        not captchas_for_submit[0]
+                        and textclick_preheat_thread is not None
+                        and textclick_preheat_thread.is_alive()
+                    ):
+                        logging.info(
+                            "[warm] Skip connection pre-warm because textclick captcha "
+                            "preheat is still waiting for validate"
+                        )
+                        warm_done = True
+                    elif not captchas_for_submit[0]:
+                        logging.info(
+                            "[warm] Skip connection pre-warm because textclick captcha "
+                            "is not ready yet"
+                        )
+                        warm_done = True
+                if warm_done:
+                    pass
+                else:
+                    first_token_start_dt = _get_first_token_start_dt(target_dt)
+                    warm_budget_s = (first_token_start_dt - _beijing_now()).total_seconds()
+                    if warm_budget_s <= 0:
+                        logging.info(
+                            "[warm] Skip connection pre-warm because token window is already due"
+                        )
+                        warm_done = True
+                    else:
+                        warm_timeout_s = min(5.0, max(0.001, warm_budget_s))
+                        logging.info(
+                            "[warm] Dispatch connection pre-warm before first probe/token window: "
+                            f"budget {warm_budget_s * 1000:.0f}ms; background timeout "
+                            f"{warm_timeout_s * 1000:.0f}ms"
+                        )
+                        _fire_and_forget_warm_connection(s, _warm_url, timeout_s=warm_timeout_s)
+                        warm_done = True
+
+        if not _ensure_textclick_captcha1_before_strategic_token():
+            continue
 
         if SUBMIT_MODE == "burst":
             # ── 定时连发（极限型）──
             n_shots = len(BURST_OFFSETS_MS)
-            captchas_list = [captcha1, captcha2, captcha3]
+            captchas_list = (
+                captchas_for_submit + [""] * max(0, n_shots - len(captchas_for_submit))
+            )[:n_shots]
 
             if STRATEGIC_MODE == "C":
                 # ── 策略 C + burst：等到 T + TOKEN_FETCH_DELAY_MS 取一次 token，复用给所有线程 ──
@@ -905,6 +1559,13 @@ def strategic_first_attempt(
                 pt, pv = s._get_page_token(_first_token_url, require_value=True)
                 if pt:
                     logging.info(f"[strategic] [burst-C] Got token from {_first_token_url}: {pt}")
+                    s.post_getusedtimes_after_token(
+                        times,
+                        roomid,
+                        first_seat,
+                        submit_day,
+                        fid_enc=fid_enc,
+                    )
                 else:
                     logging.warning("[strategic] [burst-C] Token fetch failed, threads will fetch on-the-fly")
                 pre_tokens = [(pt, pv)] * n_shots
@@ -926,6 +1587,13 @@ def strategic_first_attempt(
                 pt, pv = s._get_page_token(_first_token_url, require_value=True)
                 if pt:
                     logging.info(f"[strategic] [burst-A] Pre-fetched shared token from {_first_token_url}: {pt}")
+                    s.post_getusedtimes_after_token(
+                        times,
+                        roomid,
+                        first_seat,
+                        submit_day,
+                        fid_enc=fid_enc,
+                    )
                 else:
                     logging.warning(
                         "[strategic] [burst-A] Token pre-fetch failed, "
@@ -950,7 +1618,7 @@ def strategic_first_attempt(
                     args=(
                         burst_i, burst_offset_ms, target_dt, s, _submit_token_url,
                         times, roomid, first_seat, burst_cap, action, burst_results,
-                        pt, pv,
+                        pt, pv, use_custom_day, submit_day, fid_enc,
                     ),
                     daemon=True,
                     name=f"burst-shot-{burst_i + 1}",
@@ -997,36 +1665,65 @@ def strategic_first_attempt(
                     logging.error("[strategic] [C] Token fetch failed, skip this config")
                     continue
                 logging.info(f"[strategic] [C] Got token from {_first_token_url}: {token1}, immediately submit")
-                suc = s.get_submit(
-                    url=s.submit_url,
-                    times=times,
-                    token=token1,
-                    roomid=roomid,
-                    seatid=first_seat,
-                    captcha=captcha1,
-                    action=action,
-                    value=value1,
+                used_handle1 = s.post_getusedtimes_after_token(
+                    times,
+                    roomid,
+                    first_seat,
+                    submit_day,
+                    fid_enc=fid_enc,
                 )
+                submit_room, submit_seat, _, submit_fid, token1, value1 = _maybe_switch_to_backup(
+                    used_handle1,
+                    token1,
+                    value1,
+                    "first submit",
+                    1,
+                )
+                submit_captcha1 = _get_submit_captcha(1)
+                if submit_captcha1 is None:
+                    suc = False
+                else:
+                    suc = s.get_submit(
+                        url=s.submit_url,
+                        times=times,
+                        token=token1,
+                        roomid=submit_room,
+                        seatid=submit_seat,
+                        captcha=submit_captcha1,
+                        action=action,
+                        value=value1,
+                        dept_id_enc=submit_fid,
+                        use_custom_day=use_custom_day,
+                    )
 
             elif STRATEGIC_MODE == "A":
-                # 策略 A：目标时间前 PRE_FETCH_TOKEN_MS 毫秒预取 token，
-                #         目标时间后 FIRST_SUBMIT_OFFSET_MS 毫秒提交
+                # 策略 A：目标时间前 PRE_FETCH_TOKEN_MS 毫秒开始正式取 token；
+                #         空 token 视为失败，并持续刷新到本轮 ENDTIME；
+                #         目标时间后 FIRST_SUBMIT_OFFSET_MS 毫秒提交。
                 pre_fetch_dt = target_dt - datetime.timedelta(milliseconds=PRE_FETCH_TOKEN_MS)
+                token_retry_until = target_dt + datetime.timedelta(seconds=40)
                 _wait_until(pre_fetch_dt)
                 logging.info(
-                    f"[strategic] [A] Pre-fetch page token at {_beijing_now()} "
+                    f"[strategic] [A] Formal pre-fetch page token at {_beijing_now()} "
                     f"(target_dt - {PRE_FETCH_TOKEN_MS}ms) from {_first_token_url}"
                 )
-                token1, value1 = s._get_page_token(
+                token1, value1 = _get_page_token_until_success(
+                    s,
                     _first_token_url,
                     require_value=True,
+                    retry_until=token_retry_until,
+                    retry_interval=0.005,
+                    label="[A] First token",
                 )
                 if not token1:
-                    logging.error("[strategic] Failed to get page token for first submit, skip this config")
+                    logging.error("[strategic] [A] First token is empty, skip this config")
                     continue
-                logging.info(
-                    f"[strategic] Got page token for first submit from {_first_token_url}: "
-                    f"{token1}, value: {value1}"
+                used_handle1 = s.post_getusedtimes_after_token(
+                    times,
+                    roomid,
+                    first_seat,
+                    submit_day,
+                    fid_enc=fid_enc,
                 )
 
                 submit_dt1 = target_dt + datetime.timedelta(milliseconds=FIRST_SUBMIT_OFFSET_MS)
@@ -1034,16 +1731,29 @@ def strategic_first_attempt(
                 logging.info(
                     f"[strategic] [A] First submit at {_beijing_now()} (target_dt + {FIRST_SUBMIT_OFFSET_MS}ms)"
                 )
-                suc = s.get_submit(
-                    url=s.submit_url,
-                    times=times,
-                    token=token1,
-                    roomid=roomid,
-                    seatid=first_seat,
-                    captcha=captcha1,
-                    action=action,
-                    value=value1,
+                submit_room, submit_seat, _, submit_fid, token1, value1 = _maybe_switch_to_backup(
+                    used_handle1,
+                    token1,
+                    value1,
+                    "first submit",
+                    1,
                 )
+                submit_captcha1 = _get_submit_captcha(1)
+                if submit_captcha1 is None:
+                    suc = False
+                else:
+                    suc = s.get_submit(
+                        url=s.submit_url,
+                        times=times,
+                        token=token1,
+                        roomid=submit_room,
+                        seatid=submit_seat,
+                        captcha=submit_captcha1,
+                        action=action,
+                        value=value1,
+                        dept_id_enc=submit_fid,
+                        use_custom_day=use_custom_day,
+                    )
 
             else:
                 # 策略 B：目标时间后 FIRST_SUBMIT_OFFSET_MS 毫秒获取 token 并立即提交
@@ -1067,17 +1777,37 @@ def strategic_first_attempt(
                     f"[strategic] Got page token for first submit from {_first_token_url}: "
                     f"{token1}, value: {value1}"
                 )
-                logging.info(f"[strategic] [B] Immediately submit after fetching page token")
-                suc = s.get_submit(
-                    url=s.submit_url,
-                    times=times,
-                    token=token1,
-                    roomid=roomid,
-                    seatid=first_seat,
-                    captcha=captcha1,
-                    action=action,
-                    value=value1,
+                used_handle1 = s.post_getusedtimes_after_token(
+                    times,
+                    roomid,
+                    first_seat,
+                    submit_day,
+                    fid_enc=fid_enc,
                 )
+                logging.info(f"[strategic] [B] Immediately submit after fetching page token")
+                submit_room, submit_seat, _, submit_fid, token1, value1 = _maybe_switch_to_backup(
+                    used_handle1,
+                    token1,
+                    value1,
+                    "first submit",
+                    1,
+                )
+                submit_captcha1 = _get_submit_captcha(1)
+                if submit_captcha1 is None:
+                    suc = False
+                else:
+                    suc = s.get_submit(
+                        url=s.submit_url,
+                        times=times,
+                        token=token1,
+                        roomid=submit_room,
+                        seatid=submit_seat,
+                        captcha=submit_captcha1,
+                        action=action,
+                        value=value1,
+                        dept_id_enc=submit_fid,
+                        use_custom_day=use_custom_day,
+                    )
 
             # 如果第一次没有成功：重新获取页面 token，获取后立即提交第二枪
             if not suc:
@@ -1088,20 +1818,33 @@ def strategic_first_attempt(
                     success_list[index] = suc
                     continue
                 logging.info("[strategic] First submit failed, prepare second submit with NEW page token")
+                first_failure_msg = _last_submit_failure_msg()
+                first_failed_by_captcha = _last_submit_failed_by_captcha()
+                logging.info(
+                    "[strategic] First submit failure reason: %s; captcha_related=%s",
+                    first_failure_msg or "<empty>",
+                    first_failed_by_captcha,
+                )
+                if first_failed_by_captcha:
+                    _prepare_textclick_captcha_for_submit(
+                        2,
+                        "First submit failed because of captcha",
+                        max_retries=None,
+                    )
+                elif ENABLE_TEXTCLICK:
+                    logging.info(
+                        "[strategic] First submit did not fail because of captcha; "
+                        "reuse the preheated textclick captcha for second submit"
+                    )
 
                 if STRATEGIC_MODE == "A":
-                    token2, value2 = _probe_then_get_page_token(
+                    token2, value2 = _get_page_token_until_success(
                         s,
                         _submit_token_url,
-                        target_dt,
                         require_value=True,
-                        not_open_retry_until=not_open_retry_until,
-                        not_open_retry_interval=0.005,
-                        start_log_message=(
-                            f"[strategic] [A] 第二枪开始轻探测"
-                            f"（沿用 FAST_PROBE_DEADLINE_MS={FAST_PROBE_DEADLINE_MS}ms 截止），"
-                            f"目标链接：{_submit_token_url}"
-                        ),
+                        retry_until=target_dt + datetime.timedelta(seconds=40),
+                        retry_interval=0.005,
+                        label="[A] Second token",
                     )
                 else:
                     token2, value2 = s._get_page_token(
@@ -1111,19 +1854,39 @@ def strategic_first_attempt(
                 if not token2:
                     logging.error("[strategic] Failed to get page token for second submit, skip to third/normal flow")
                 else:
+                    used_handle2 = s.post_getusedtimes_after_token(
+                        times,
+                        roomid,
+                        first_seat,
+                        submit_day,
+                        fid_enc=fid_enc,
+                    )
                     logging.info(
                         "[strategic] Second submit immediately after fetching NEW page token"
                     )
-                    suc = s.get_submit(
-                        url=s.submit_url,
-                        times=times,
-                        token=token2,
-                        roomid=roomid,
-                        seatid=first_seat,
-                        captcha=captcha2,
-                        action=action,
-                        value=value2,
+                    submit_room, submit_seat, _, submit_fid, token2, value2 = _maybe_switch_to_backup(
+                        used_handle2,
+                        token2,
+                        value2,
+                        "second submit",
+                        2,
                     )
+                    submit_captcha2 = _get_submit_captcha(2)
+                    if submit_captcha2 is None:
+                        suc = False
+                    else:
+                        suc = s.get_submit(
+                            url=s.submit_url,
+                            times=times,
+                            token=token2,
+                            roomid=submit_room,
+                            seatid=submit_seat,
+                            captcha=submit_captcha2,
+                            action=action,
+                            value=value2,
+                            dept_id_enc=submit_fid,
+                            use_custom_day=use_custom_day,
+                        )
 
             # 如果第二次仍未成功：重新获取页面 token，获取后立即提交第三枪
             if not suc:
@@ -1134,6 +1897,24 @@ def strategic_first_attempt(
                     success_list[index] = suc
                     continue
                 logging.info("[strategic] Second submit failed, prepare third submit with NEW page token")
+                second_failure_msg = _last_submit_failure_msg()
+                second_failed_by_captcha = _last_submit_failed_by_captcha()
+                logging.info(
+                    "[strategic] Second submit failure reason: %s; captcha_related=%s",
+                    second_failure_msg or "<empty>",
+                    second_failed_by_captcha,
+                )
+                if second_failed_by_captcha:
+                    _prepare_textclick_captcha_for_submit(
+                        3,
+                        "Second submit failed because of captcha",
+                        max_retries=None,
+                    )
+                elif ENABLE_TEXTCLICK:
+                    logging.info(
+                        "[strategic] Second submit did not fail because of captcha; "
+                        "reuse the current textclick captcha for third submit"
+                    )
 
                 token3, value3 = s._get_page_token(
                     _submit_token_url,
@@ -1142,19 +1923,39 @@ def strategic_first_attempt(
                 if not token3:
                     logging.error("[strategic] Failed to get page token for third submit, give up strategic submits for this config")
                 else:
+                    used_handle3 = s.post_getusedtimes_after_token(
+                        times,
+                        roomid,
+                        first_seat,
+                        submit_day,
+                        fid_enc=fid_enc,
+                    )
                     logging.info(
                         "[strategic] Third submit immediately after fetching NEW page token"
                     )
-                    suc = s.get_submit(
-                        url=s.submit_url,
-                        times=times,
-                        token=token3,
-                        roomid=roomid,
-                        seatid=first_seat,
-                        captcha=captcha3,
-                        action=action,
-                        value=value3,
+                    submit_room, submit_seat, _, submit_fid, token3, value3 = _maybe_switch_to_backup(
+                        used_handle3,
+                        token3,
+                        value3,
+                        "third submit",
+                        3,
                     )
+                    submit_captcha3 = _get_submit_captcha(3)
+                    if submit_captcha3 is None:
+                        suc = False
+                    else:
+                        suc = s.get_submit(
+                            url=s.submit_url,
+                            times=times,
+                            token=token3,
+                            roomid=submit_room,
+                            seatid=submit_seat,
+                            captcha=submit_captcha3,
+                            action=action,
+                            value=value3,
+                            dept_id_enc=submit_fid,
+                            use_custom_day=use_custom_day,
+                        )
 
         success_list[index] = suc
 
@@ -1194,6 +1995,8 @@ def login_and_reserve(
         seatid = user["seatid"]
         seat_page_id = user.get("seatPageId")
         fid_enc = user.get("fidEnc")
+        backup_slots = _normalize_backup_slots(user.get("backupSeats") or user.get("backupSlots"))
+        use_custom_day = bool(user.get("use_custom_day"))
         daysofweek = user["daysofweek"]
 
         # 如果今天不在该配置的 daysofweek 中，直接跳过
@@ -1232,6 +2035,7 @@ def login_and_reserve(
                         enable_slider=ENABLE_SLIDER,
                         enable_textclick=ENABLE_TEXTCLICK,
                         reserve_next_day=RESERVE_NEXT_DAY,
+                        reserve_day_offset=RESERVE_DAY_OFFSET,
                     )
                     if not s.bootstrap_login(username, password):
                         logging.warning(
@@ -1250,6 +2054,7 @@ def login_and_reserve(
                     enable_slider=ENABLE_SLIDER,
                     enable_textclick=ENABLE_TEXTCLICK,
                     reserve_next_day=RESERVE_NEXT_DAY,
+                    reserve_day_offset=RESERVE_DAY_OFFSET,
                 )
                 if not s.bootstrap_login(username, password):
                     logging.warning(
@@ -1266,6 +2071,8 @@ def login_and_reserve(
                 ENDTIME if action else None,
                 fidEnc=fid_enc,
                 seat_page_id=seat_page_id,
+                use_custom_day=use_custom_day,
+                backup_slots=backup_slots,
             )
             success_list[index] = suc
     return success_list
@@ -1274,8 +2081,9 @@ def login_and_reserve(
 def main(users, action=False):
     global MAX_ATTEMPT
     target_dt = _get_beijing_target_from_endtime()
+    end_dt = _get_beijing_end_dt_from_target(target_dt)
     logging.info(
-        f"start time {get_log_time(action)}, action {'on' if action else 'off'}, target_dt {target_dt}"
+        f"start time {get_log_time(action)}, action {'on' if action else 'off'}, target_dt {target_dt}, end_dt {end_dt}"
     )
     attempt_times = 0
     usernames, passwords = None, None
@@ -1317,11 +2125,10 @@ def main(users, action=False):
     fallback_used_seats = [set() for _ in users]
 
     while True:
-        # 使用逻辑时间 _now(action)，在 GitHub Actions 下就是北京时间
-        current_time = get_hms(action)
-        if current_time >= ENDTIME:
+        current_dt = _beijing_now()
+        if current_dt >= end_dt:
             logging.info(
-                f"Current time {current_time} >= ENDTIME {ENDTIME}, stop main loop"
+                f"Current time {current_dt.strftime('%Y-%m-%d %H:%M:%S')} >= end_dt {end_dt.strftime('%Y-%m-%d %H:%M:%S')} (ENDTIME {ENDTIME}), stop main loop"
             )
             return
 
@@ -1415,7 +2222,7 @@ def main(users, action=False):
             )
 
         print(
-            f"attempt time {attempt_times}, time now {current_time}, success list {success_list}"
+            f"attempt time {attempt_times}, time now {current_dt}, success list {success_list}"
         )
         if sum(success_list) == today_reservation_num:
             print(f"reserved successfully!")
@@ -1450,6 +2257,8 @@ def debug(users, action=False):
         seatid = user["seatid"]
         seat_page_id = user.get("seatPageId")
         fid_enc = user.get("fidEnc")
+        backup_slots = _normalize_backup_slots(user.get("backupSeats") or user.get("backupSlots"))
+        use_custom_day = bool(user.get("use_custom_day"))
         daysofweek = user["daysofweek"]
         if type(seatid) == str:
             seatid = [seatid]
@@ -1481,11 +2290,22 @@ def debug(users, action=False):
             enable_slider=ENABLE_SLIDER,
             enable_textclick=ENABLE_TEXTCLICK,
             reserve_next_day=RESERVE_NEXT_DAY,
+            reserve_day_offset=RESERVE_DAY_OFFSET,
         )
         if not s.bootstrap_login(username, password):
             logging.warning(f"Skip debug reserve attempt for {username}: login bootstrap failed")
             continue
-        suc = s.submit(times, roomid, seatid, action, None, fidEnc=fid_enc, seat_page_id=seat_page_id)
+        suc = s.submit(
+            times,
+            roomid,
+            seatid,
+            action,
+            None,
+            fidEnc=fid_enc,
+            seat_page_id=seat_page_id,
+            use_custom_day=use_custom_day,
+            backup_slots=backup_slots,
+        )
         if suc:
             return
 
@@ -1499,6 +2319,7 @@ def get_roomid(args1, args2):
         enable_slider=ENABLE_SLIDER,
         enable_textclick=ENABLE_TEXTCLICK,
         reserve_next_day=RESERVE_NEXT_DAY,
+        reserve_day_offset=RESERVE_DAY_OFFSET,
     )
     if not s.bootstrap_login(username=username, password=password):
         logging.error("Failed to bootstrap login session, abort room query")
